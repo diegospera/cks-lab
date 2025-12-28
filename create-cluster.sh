@@ -283,8 +283,8 @@ stream_cloud_init_logs() {
     multipass exec "$node" -- tail -f /var/log/cloud-init-output.log 2>/dev/null &
     local tail_pid=$!
     
-    # Wait for completion marker
-    while ! multipass exec "$node" -- test -f /var/lib/cloud/instance/kubeadm-ready 2>/dev/null; do
+    # Wait for cloud-init to fully complete
+    while ! multipass exec "$node" -- cloud-init status --wait 2>/dev/null | grep -q "done"; do
         sleep 2
     done
     
@@ -294,6 +294,23 @@ stream_cloud_init_logs() {
     echo ""
 }
 
+is_cloud_init_done() {
+    local node=$1
+    
+    # Check cloud-init status (most reliable)
+    local status
+    status=$(multipass exec "$node" -- cloud-init status 2>/dev/null || echo "")
+    
+    if echo "$status" | grep -q "status: done"; then
+        # Double-check that kubeadm is actually installed
+        if multipass exec "$node" -- which kubeadm &>/dev/null; then
+            return 0
+        fi
+    fi
+    
+    return 1
+}
+
 wait_for_cloud_init() {
     log_info "Waiting for cloud-init to complete on all nodes..."
     echo ""
@@ -301,18 +318,28 @@ wait_for_cloud_init() {
     for node in "${ALL_NODES[@]}"; do
         local start_time=$(date +%s)
         
+        # First, wait for VM to be responsive
+        echo -ne "  ${CYAN}$node${NC}: waiting for VM..."
+        local vm_attempts=0
+        while ! multipass exec "$node" -- true &>/dev/null; do
+            sleep 2
+            ((vm_attempts++))
+            if [[ $vm_attempts -gt 30 ]]; then
+                echo -e "\r\033[K  ${CYAN}$node${NC}: ${RED}VM not responding${NC}"
+                continue 2
+            fi
+        done
+        
         if $VERBOSE; then
-            echo -e "${BLUE}━━━ $node cloud-init logs ━━━${NC}"
+            echo -e "\r\033[K${BLUE}━━━ $node cloud-init logs ━━━${NC}"
             stream_cloud_init_logs "$node"
             local end_time=$(date +%s)
             local duration=$((end_time - start_time))
             echo -e "${GREEN}✓ $node ready${NC} (${duration}s)"
             echo ""
         else
-            echo -ne "  ${CYAN}$node${NC}: "
-            
             local last_stage=""
-            while ! multipass exec "$node" -- test -f /var/lib/cloud/instance/kubeadm-ready 2>/dev/null; do
+            while ! is_cloud_init_done "$node"; do
                 current_stage=$(get_cloud_init_stage "$node")
                 
                 # Only update if stage changed
@@ -451,24 +478,50 @@ EOF"
 }
 
 #######################################
-# Install CNI (Calico)
+# Install CNI (Cilium)
 #######################################
 install_cni() {
-    log_info "Installing Calico CNI v3.31..."
+    log_info "Installing Cilium CNI..."
 
-    # Install Calico operator and CRDs
-    log_progress "Applying Tigera operator..."
-    multipass exec "$CONTROL_NODE" -- kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.2/manifests/tigera-operator.yaml 2>/dev/null
+    # Install Cilium CLI on control plane
+    log_progress "Installing Cilium CLI..."
+    multipass exec "$CONTROL_NODE" -- bash -c '
+        CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
+        CLI_ARCH=amd64
+        if [ "$(uname -m)" = "aarch64" ]; then CLI_ARCH=arm64; fi
+        curl -L --fail --remote-name-all https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
+        sha256sum --check cilium-linux-${CLI_ARCH}.tar.gz.sha256sum
+        sudo tar xzvfC cilium-linux-${CLI_ARCH}.tar.gz /usr/local/bin
+        rm cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
+    ' 2>/dev/null
 
-    # Wait for operator
-    log_progress "Waiting for operator to be ready..."
-    sleep 10
+    # Install Cilium with encryption enabled (CKS exam topic)
+    log_progress "Installing Cilium with WireGuard encryption..."
+    multipass exec "$CONTROL_NODE" -- cilium install --set encryption.enabled=true --set encryption.type=wireguard 2>/dev/null
 
-    # Install Calico custom resources
-    log_progress "Applying Calico custom resources..."
-    multipass exec "$CONTROL_NODE" -- kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.2/manifests/custom-resources.yaml 2>/dev/null
+    # Wait for Cilium to be ready
+    log_progress "Waiting for Cilium to be ready (this may take 2-3 minutes)..."
+    local attempts=0
+    local max_attempts=36  # 3 minutes
+    
+    while [[ $attempts -lt $max_attempts ]]; do
+        local status
+        status=$(multipass exec "$CONTROL_NODE" -- cilium status 2>/dev/null | grep -E "Cilium.*OK" || echo "")
+        if [[ -n "$status" ]]; then
+            log_progress "Cilium is running"
+            break
+        fi
+        echo -n "."
+        sleep 5
+        ((attempts++))
+    done
+    echo ""
 
-    log_success "Calico CNI v3.31 installed"
+    if [[ $attempts -eq $max_attempts ]]; then
+        log_warn "Timeout waiting for Cilium. Check status with: cilium status"
+    fi
+
+    log_success "Cilium CNI installed with WireGuard encryption"
 }
 
 #######################################
@@ -546,12 +599,19 @@ install_cks_tools() {
     '
     echo -e "\r\033[K  ${CYAN}Trivy${NC}: ${GREEN}✓ installed${NC}"
 
-    # Install kube-bench
+    # Install kube-bench (with arm64 support)
     echo -ne "  ${CYAN}kube-bench${NC}: installing..."
     multipass exec "$CONTROL_NODE" -- bash -c '
-        curl -sLO https://github.com/aquasecurity/kube-bench/releases/download/v0.7.1/kube-bench_0.7.1_linux_amd64.deb
-        sudo dpkg -i kube-bench_0.7.1_linux_amd64.deb > /dev/null 2>&1
-        rm kube-bench_0.7.1_linux_amd64.deb
+        ARCH=$(dpkg --print-architecture)
+        if [ "$ARCH" = "arm64" ]; then
+            curl -sLO https://github.com/aquasecurity/kube-bench/releases/download/v0.8.0/kube-bench_0.8.0_linux_arm64.deb
+            sudo dpkg -i kube-bench_0.8.0_linux_arm64.deb > /dev/null 2>&1
+            rm kube-bench_0.8.0_linux_arm64.deb
+        else
+            curl -sLO https://github.com/aquasecurity/kube-bench/releases/download/v0.8.0/kube-bench_0.8.0_linux_amd64.deb
+            sudo dpkg -i kube-bench_0.8.0_linux_amd64.deb > /dev/null 2>&1
+            rm kube-bench_0.8.0_linux_amd64.deb
+        fi
     '
     echo -e "\r\033[K  ${CYAN}kube-bench${NC}: ${GREEN}✓ installed${NC}"
 
@@ -565,8 +625,44 @@ install_cks_tools() {
     '
     echo -e "\r\033[K  ${CYAN}Falco${NC}: ${GREEN}✓ installed${NC}"
 
+    # Install Kubesec (static analysis - NEW in Oct 2024 curriculum)
+    echo -ne "  ${CYAN}Kubesec${NC}: installing..."
+    multipass exec "$CONTROL_NODE" -- bash -c '
+        ARCH=$(uname -m)
+        if [ "$ARCH" = "aarch64" ]; then
+            curl -sLO https://github.com/controlplaneio/kubesec/releases/download/v2.14.2/kubesec_linux_arm64.tar.gz
+            tar -xzf kubesec_linux_arm64.tar.gz
+            rm kubesec_linux_arm64.tar.gz
+        else
+            curl -sLO https://github.com/controlplaneio/kubesec/releases/download/v2.14.2/kubesec_linux_amd64.tar.gz
+            tar -xzf kubesec_linux_amd64.tar.gz
+            rm kubesec_linux_amd64.tar.gz
+        fi
+        sudo mv kubesec /usr/local/bin/
+        sudo chmod +x /usr/local/bin/kubesec
+    '
+    echo -e "\r\033[K  ${CYAN}Kubesec${NC}: ${GREEN}✓ installed${NC}"
+
+    # Install KubeLinter (static analysis - NEW in Oct 2024 curriculum)
+    echo -ne "  ${CYAN}KubeLinter${NC}: installing..."
+    multipass exec "$CONTROL_NODE" -- bash -c '
+        ARCH=$(uname -m)
+        if [ "$ARCH" = "aarch64" ]; then
+            curl -sLO https://github.com/stackrox/kube-linter/releases/download/v0.7.1/kube-linter-linux_arm64.tar.gz
+            tar -xzf kube-linter-linux_arm64.tar.gz
+            rm kube-linter-linux_arm64.tar.gz
+        else
+            curl -sLO https://github.com/stackrox/kube-linter/releases/download/v0.7.1/kube-linter-linux.tar.gz
+            tar -xzf kube-linter-linux.tar.gz
+            rm kube-linter-linux.tar.gz
+        fi
+        sudo mv kube-linter /usr/local/bin/
+        sudo chmod +x /usr/local/bin/kube-linter
+    '
+    echo -e "\r\033[K  ${CYAN}KubeLinter${NC}: ${GREEN}✓ installed${NC}"
+
     echo ""
-    log_success "CKS tools installed"
+    log_success "CKS tools installed (Oct 2024 curriculum)"
 }
 
 #######################################
@@ -607,12 +703,13 @@ print_summary() {
     echo ""
     echo "========================================"
     echo -e "${GREEN}CKS Practice Cluster Ready!${NC}"
+    echo -e "${DIM}(Aligned with October 2024 CKS Curriculum)${NC}"
     echo "========================================"
     echo ""
     echo -e "${CYAN}Cluster Details:${NC}"
     echo "  Kubernetes:    v$K8S_VERSION"
     echo "  kubeadm API:   $KUBEADM_API_VERSION"
-    echo "  CNI:           Calico v3.31"
+    echo "  CNI:           Cilium (with WireGuard encryption)"
     echo "  Runtime:       containerd (cgroup v2)"
     echo "  Ubuntu:        $UBUNTU_VERSION"
     echo "  Nodes:         3 (1 control + 2 workers)"
@@ -627,15 +724,25 @@ print_summary() {
     echo -e "${BLUE}From your Mac:${NC}"
     echo "  export KUBECONFIG=$KUBECONFIG_LOCAL"
     echo ""
-    echo -e "${BLUE}CKS Tools (on control plane):${NC}"
+    echo -e "${BLUE}CKS Tools - Supply Chain Security (20%):${NC}"
     echo "  trivy image nginx:latest              # Scan images for CVEs"
+    echo "  trivy image --severity CRITICAL img   # Filter by severity"
+    echo "  kubesec scan pod.yaml                 # Static analysis (YAML)"
+    echo "  kube-linter lint deployment.yaml      # Lint K8s manifests"
+    echo ""
+    echo -e "${BLUE}CKS Tools - Cluster Setup (15%):${NC}"
     echo "  sudo kube-bench run --targets=master  # CIS benchmark"
-    echo "  sudo systemctl start falco            # Runtime security"
+    echo "  cilium status                         # Cilium health"
+    echo "  cilium connectivity test              # Network connectivity"
+    echo ""
+    echo -e "${BLUE}CKS Tools - Runtime Security (20%):${NC}"
+    echo "  sudo systemctl start falco            # Start Falco"
     echo "  sudo journalctl -fu falco             # View Falco alerts"
     echo ""
     echo -e "${BLUE}CKS Practice Features Enabled:${NC}"
     echo "  ✓ Audit logging (/var/log/kubernetes/audit/audit.log)"
-    echo "  ✓ NetworkPolicy support (Calico)"
+    echo "  ✓ Cilium NetworkPolicy + CiliumNetworkPolicy"
+    echo "  ✓ Pod-to-Pod encryption (WireGuard)"
     echo "  ✓ Pod Security Admission ready"
     echo "  ✓ RBAC enabled"
     echo "  ✓ NodeRestriction admission plugin"
@@ -646,6 +753,7 @@ print_summary() {
     echo "  /var/log/kubernetes/audit/         # Audit logs"
     echo "  /etc/kubernetes/pki/               # Certificates"
     echo "  /etc/kubernetes/enc/               # Encryption configs (practice)"
+    echo "  /etc/falco/falco_rules.local.yaml  # Custom Falco rules"
     echo ""
     echo -e "${YELLOW}To destroy cluster:${NC} ./destroy-cluster.sh"
     echo ""

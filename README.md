@@ -2,12 +2,19 @@
 
 A single-command setup for a 3-node Kubernetes cluster optimized for CKS (Certified Kubernetes Security Specialist) exam preparation.
 
+**Aligned with the October 2024 CKS Curriculum Update**
+
 ## Features
 
 - **Latest Kubernetes** (1.35 by default, configurable)
-- **Calico CNI** v3.31 for NetworkPolicy support
+- **Cilium CNI** with WireGuard pod-to-pod encryption (NEW in Oct 2024)
 - **Audit logging** pre-configured and enabled
-- **CKS tools** pre-installed (Trivy, kube-bench, Falco)
+- **CKS tools** pre-installed:
+  - Trivy (image scanning)
+  - kube-bench (CIS benchmarks)
+  - Falco (runtime security)
+  - Kubesec (static YAML analysis) - NEW
+  - KubeLinter (manifest linting) - NEW
 - **Security best practices** out of the box
 - **Ubuntu 24.04** with cgroup v2
 
@@ -20,7 +27,7 @@ A single-command setup for a 3-node Kubernetes cluster optimized for CKS (Certif
 ## Quick Start
 
 ```bash
-# Create the cluster (takes ~5-8 minutes)
+# Create the cluster (takes ~8-10 minutes)
 ./create-cluster.sh
 
 # Destroy when done
@@ -67,17 +74,20 @@ The script automatically detects which kubeadm API version to use based on your 
 | Component | Version | Notes |
 |-----------|---------|-------|
 | Kubernetes | 1.35 | Latest stable, configurable |
-| Calico | 3.31.2 | NetworkPolicy support |
+| Cilium | Latest | CNI with WireGuard encryption |
 | containerd | Latest | cgroup v2 enabled |
 | Ubuntu | 24.04 | LTS with modern kernel |
 
-### CKS Tools Pre-installed
+### CKS Tools Pre-installed (October 2024 Curriculum)
 
-| Tool | Purpose |
-|------|---------|
-| **Trivy** | Container image vulnerability scanning |
-| **kube-bench** | CIS Kubernetes Benchmark checks |
-| **Falco** | Runtime security monitoring |
+| Tool | Domain | Weight | Purpose |
+|------|--------|--------|---------|
+| **Trivy** | Supply Chain Security | 20% | Container image vulnerability scanning |
+| **Kubesec** | Supply Chain Security | 20% | Static YAML security analysis |
+| **KubeLinter** | Supply Chain Security | 20% | Kubernetes manifest linting |
+| **kube-bench** | Cluster Setup | 15% | CIS Kubernetes Benchmark checks |
+| **Falco** | Monitoring/Runtime | 20% | Runtime security monitoring |
+| **Cilium** | Cluster Setup + Microservices | 15%+20% | NetworkPolicy + Pod encryption |
 
 ### Security Features Enabled
 
@@ -85,7 +95,8 @@ The script automatically detects which kubeadm API version to use based on your 
 - ✓ NodeRestriction admission plugin
 - ✓ RBAC enabled
 - ✓ Pod Security Admission ready
-- ✓ NetworkPolicy support (Calico)
+- ✓ Cilium NetworkPolicy + CiliumNetworkPolicy
+- ✓ Pod-to-Pod encryption (WireGuard)
 
 ## Usage
 
@@ -108,17 +119,75 @@ kubectl get nodes
 # SSH to control plane
 multipass shell control
 
-# Scan an image for vulnerabilities
+# === Supply Chain Security (20%) ===
+
+# Trivy - Scan images for vulnerabilities
 trivy image nginx:latest
 trivy image --severity HIGH,CRITICAL nginx:latest
+trivy image --ignore-unfixed nginx:latest
 
-# Run CIS benchmark
+# Kubesec - Static analysis of YAML manifests
+kubesec scan pod.yaml
+kubectl get pod mypod -o yaml | kubesec scan -
+
+# KubeLinter - Lint Kubernetes manifests
+kube-linter lint deployment.yaml
+kube-linter lint ./manifests/
+
+# === Cluster Setup (15%) ===
+
+# kube-bench - CIS benchmark
 sudo kube-bench run --targets=master
 sudo kube-bench run --targets=node
 
-# Start Falco runtime monitoring
+# Cilium - Network status and policies
+cilium status
+cilium connectivity test
+kubectl get ciliumnetworkpolicies
+kubectl get ciliumendpoints
+
+# === Runtime Security (20%) ===
+
+# Falco - Runtime monitoring
 sudo systemctl start falco
 sudo journalctl -fu falco
+# Custom rules: /etc/falco/falco_rules.local.yaml
+```
+
+### Cilium Network Policies (NEW in Oct 2024)
+
+```bash
+# Standard Kubernetes NetworkPolicy (works with Cilium)
+kubectl apply -f - <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+EOF
+
+# CiliumNetworkPolicy (Cilium-specific, more powerful)
+kubectl apply -f - <<EOF
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-frontend
+spec:
+  endpointSelector:
+    matchLabels:
+      app: frontend
+  ingress:
+  - fromEndpoints:
+    - matchLabels:
+        app: backend
+EOF
+
+# Check encryption status
+cilium encrypt status
 ```
 
 ### View Audit Logs
@@ -127,6 +196,30 @@ sudo journalctl -fu falco
 multipass shell control
 sudo tail -f /var/log/kubernetes/audit/audit.log | jq .
 ```
+
+## CKS Exam Domains (October 2024)
+
+This lab covers all six CKS domains. Here's what you can practice:
+
+| Domain | Weight | Lab Coverage |
+|--------|--------|--------------|
+| **Cluster Setup** | 15% | ✓ Cilium NetworkPolicy, CIS benchmarks (kube-bench), audit logging |
+| **Cluster Hardening** | 15% | ✓ RBAC, ServiceAccount security, API server hardening |
+| **System Hardening** | 10% | ✓ AppArmor, seccomp (Ubuntu 24.04 ready) |
+| **Minimize Microservice Vulnerabilities** | 20% | ✓ Pod Security Standards, Cilium encryption, SecurityContext |
+| **Supply Chain Security** | 20% | ✓ Trivy, Kubesec, KubeLinter, image scanning |
+| **Monitoring, Logging, Runtime Security** | 20% | ✓ Falco, audit logs, behavioral analytics |
+
+### Key Exam Topics to Practice
+
+1. **Cilium Network Policies** - Both standard K8s NetworkPolicy AND CiliumNetworkPolicy
+2. **Pod-to-Pod Encryption** - WireGuard is pre-configured, practice verifying with `cilium encrypt status`
+3. **Trivy Scanning** - Filter by severity, ignore unfixed, JSON output
+4. **Falco Rules** - Modify `/etc/falco/falco_rules.local.yaml`, restart and verify
+5. **Secrets Encryption at Rest** - Use `/etc/kubernetes/enc/` directory to practice
+6. **Audit Logging** - Policy already configured, practice reading logs
+7. **RBAC** - Create Roles, ClusterRoles, bindings imperatively
+8. **Pod Security Standards** - Apply namespace labels for enforce/audit/warn
 
 ## CKS Practice Scenarios
 
@@ -143,10 +236,10 @@ sudo cat /etc/kubernetes/audit-policy.yaml
 sudo cat /etc/kubernetes/enc/encryption-config.yaml
 ```
 
-### 2. Network Policies
+### 2. Network Policies (Standard + Cilium)
 
 ```bash
-# Create default deny all
+# Default deny all (standard Kubernetes NetworkPolicy)
 kubectl apply -f - <<EOF
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -160,7 +253,7 @@ spec:
   - Egress
 EOF
 
-# Allow specific traffic
+# Allow specific traffic (standard)
 kubectl apply -f - <<EOF
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -179,6 +272,30 @@ spec:
     ports:
     - protocol: TCP
       port: 80
+EOF
+
+# CiliumNetworkPolicy with Layer 7 filtering (exam topic)
+kubectl apply -f - <<EOF
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: l7-policy
+spec:
+  endpointSelector:
+    matchLabels:
+      app: api
+  ingress:
+  - fromEndpoints:
+    - matchLabels:
+        app: frontend
+    toPorts:
+    - ports:
+      - port: "80"
+        protocol: TCP
+      rules:
+        http:
+        - method: GET
+          path: "/api/.*"
 EOF
 ```
 
@@ -259,6 +376,118 @@ spec:
 EOF
 ```
 
+### 7. AppArmor Profiles
+
+```bash
+# SSH to a node
+multipass shell control
+
+# Check loaded AppArmor profiles
+sudo aa-status
+
+# Create a custom AppArmor profile
+sudo tee /etc/apparmor.d/k8s-deny-write <<EOF
+#include <tunables/global>
+profile k8s-deny-write flags=(attach_disconnected) {
+  #include <abstractions/base>
+  file,
+  deny /tmp/** w,
+  deny /var/tmp/** w,
+}
+EOF
+
+# Load the profile
+sudo apparmor_parser -r /etc/apparmor.d/k8s-deny-write
+
+# Use in a pod (K8s 1.30+)
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: apparmor-pod
+spec:
+  securityContext:
+    appArmorProfile:
+      type: Localhost
+      localhostProfile: k8s-deny-write
+  containers:
+  - name: app
+    image: busybox
+    command: ["sleep", "3600"]
+EOF
+```
+
+### 8. Seccomp Profiles
+
+```bash
+# Create seccomp profile directory (on node)
+sudo mkdir -p /var/lib/kubelet/seccomp/profiles
+
+# Create a custom seccomp profile
+sudo tee /var/lib/kubelet/seccomp/profiles/audit.json <<EOF
+{
+  "defaultAction": "SCMP_ACT_LOG"
+}
+EOF
+
+# Use in a pod
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: seccomp-pod
+spec:
+  securityContext:
+    seccompProfile:
+      type: Localhost
+      localhostProfile: profiles/audit.json
+  containers:
+  - name: app
+    image: busybox
+    command: ["sleep", "3600"]
+EOF
+
+# Or use RuntimeDefault (recommended)
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: seccomp-default
+spec:
+  securityContext:
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+  - name: app
+    image: nginx
+EOF
+```
+
+### 9. Falco Rules Practice
+
+```bash
+# SSH to control plane
+multipass shell control
+
+# Edit custom Falco rules
+sudo tee -a /etc/falco/falco_rules.local.yaml <<EOF
+- rule: Detect Shell in Container
+  desc: Alert when a shell is spawned in a container
+  condition: container.id != host and proc.name in (bash, sh, zsh)
+  output: "Shell spawned in container (user=%user.name container=%container.name command=%proc.cmdline)"
+  priority: WARNING
+EOF
+
+# Restart Falco
+sudo systemctl restart falco
+
+# Watch Falco logs
+sudo journalctl -fu falco
+
+# In another terminal, trigger the rule
+kubectl run test --image=busybox --rm -it -- sh
+```
+
 ## Key Paths on Control Plane
 
 | Path | Description |
@@ -268,6 +497,11 @@ EOF
 | `/var/log/kubernetes/audit/` | Audit log files |
 | `/etc/kubernetes/pki/` | Cluster certificates |
 | `/etc/kubernetes/enc/` | Encryption configs (for practice) |
+| `/etc/falco/falco.yaml` | Falco main configuration |
+| `/etc/falco/falco_rules.yaml` | Default Falco rules (don't edit) |
+| `/etc/falco/falco_rules.local.yaml` | Custom Falco rules (edit this!) |
+| `/var/lib/kubelet/seccomp/` | Seccomp profiles directory |
+| `/etc/apparmor.d/` | AppArmor profiles |
 
 ## Troubleshooting
 
@@ -280,8 +514,11 @@ multipass exec control -- sudo systemctl status kubelet
 # Check kubelet logs
 multipass exec control -- sudo journalctl -xeu kubelet
 
-# Check Calico pods
-multipass exec control -- kubectl get pods -n calico-system
+# Check Cilium status
+multipass exec control -- cilium status
+
+# Check Cilium pods
+multipass exec control -- kubectl get pods -n kube-system -l app.kubernetes.io/part-of=cilium
 ```
 
 ### Cloud-init issues
@@ -292,6 +529,22 @@ multipass exec control -- cloud-init status
 
 # Check cloud-init logs
 multipass exec control -- sudo cat /var/log/cloud-init-output.log
+```
+
+### Cilium troubleshooting
+
+```bash
+# Detailed Cilium status
+multipass exec control -- cilium status --verbose
+
+# Check Cilium connectivity
+multipass exec control -- cilium connectivity test
+
+# Check encryption status
+multipass exec control -- cilium encrypt status
+
+# View Cilium logs
+multipass exec control -- kubectl logs -n kube-system -l app.kubernetes.io/name=cilium-agent
 ```
 
 ### Reset a node
