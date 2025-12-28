@@ -1,6 +1,6 @@
 # Generated files
 cks-kubeconfig
-cloud-init-*.yaml
+cloud-init*.yaml
 *.log
 
 # Secrets
