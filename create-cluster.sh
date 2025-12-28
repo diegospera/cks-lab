@@ -11,12 +11,15 @@ CONTROL_NODE="control"
 WORKER_NODES=("worker1" "worker2")
 ALL_NODES=("$CONTROL_NODE" "${WORKER_NODES[@]}")
 CPUS=2
-MEMORY="2G"
-DISK="20G"
-UBUNTU_VERSION="22.04"
+MEMORY="4G"  # Increased for 1.35
+DISK="25G"
+UBUNTU_VERSION="24.04"  # Newer Ubuntu for better compatibility
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLOUD_INIT="$SCRIPT_DIR/cloud-init.yaml"
 KUBECONFIG_LOCAL="$SCRIPT_DIR/kubeconfig"
+
+# Kubernetes version (default to latest stable)
+K8S_VERSION="1.35"
 
 # Flags
 VERBOSE=false
@@ -44,8 +47,19 @@ usage() {
     echo "Usage: $0 [OPTIONS]"
     echo ""
     echo "Options:"
-    echo "  -v, --verbose    Show detailed cloud-init progress and logs"
-    echo "  -h, --help       Show this help message"
+    echo "  -v, --verbose          Show detailed cloud-init progress and logs"
+    echo "  -k, --k8s-version VER  Kubernetes version (default: $K8S_VERSION)"
+    echo "  -h, --help             Show this help message"
+    echo ""
+    echo "Examples:"
+    echo "  $0                     # Create cluster with K8s $K8S_VERSION (latest)"
+    echo "  $0 -k 1.34             # Create cluster with K8s 1.34"
+    echo "  $0 -k 1.30             # Create cluster with K8s 1.30 (uses v1beta3)"
+    echo "  $0 -v                  # Verbose mode with full logs"
+    echo ""
+    echo "Version compatibility:"
+    echo "  K8s 1.31+  → kubeadm API v1beta4, requires cgroup v2 for 1.35+"
+    echo "  K8s 1.22-1.30 → kubeadm API v1beta3"
     echo ""
     exit 0
 }
@@ -56,6 +70,10 @@ parse_args() {
             -v|--verbose)
                 VERBOSE=true
                 shift
+                ;;
+            -k|--k8s-version)
+                K8S_VERSION="$2"
+                shift 2
                 ;;
             -h|--help)
                 usage
@@ -79,12 +97,142 @@ check_prerequisites() {
         exit 1
     fi
 
-    if [[ ! -f "$CLOUD_INIT" ]]; then
-        log_error "cloud-init.yaml not found at $CLOUD_INIT"
-        exit 1
-    fi
-
     log_success "Prerequisites check passed"
+}
+
+#######################################
+# Determine kubeadm API version
+# v1beta4 for K8s 1.31+, v1beta3 for older
+#######################################
+get_kubeadm_api_version() {
+    local major minor
+    major=$(echo "$K8S_VERSION" | cut -d. -f1)
+    minor=$(echo "$K8S_VERSION" | cut -d. -f2)
+    
+    # v1beta4 introduced in 1.31
+    if [[ "$major" -ge 1 && "$minor" -ge 31 ]]; then
+        echo "v1beta4"
+    else
+        echo "v1beta3"
+    fi
+}
+
+#######################################
+# Check if K8s version requires cgroup v2
+# K8s 1.35+ dropped cgroup v1 support
+#######################################
+check_cgroup_requirements() {
+    local minor
+    minor=$(echo "$K8S_VERSION" | cut -d. -f2)
+    
+    if [[ "$minor" -ge 35 ]]; then
+        log_info "Kubernetes $K8S_VERSION requires cgroup v2 (Ubuntu 24.04 provides this)"
+    fi
+}
+
+#######################################
+# Generate cloud-init config
+#######################################
+generate_cloud_init() {
+    log_info "Generating cloud-init config for Kubernetes $K8S_VERSION..."
+    
+    cat > "$CLOUD_INIT" <<EOF
+#cloud-config
+package_update: true
+package_upgrade: false
+
+packages:
+  - apt-transport-https
+  - ca-certificates
+  - curl
+  - gpg
+  - containerd
+  - socat
+  - conntrack
+  - ethtool
+  - iptables
+
+write_files:
+  - path: /etc/modules-load.d/k8s.conf
+    content: |
+      overlay
+      br_netfilter
+
+  - path: /etc/sysctl.d/k8s.conf
+    content: |
+      net.bridge.bridge-nf-call-iptables  = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward                 = 1
+
+  - path: /etc/crictl.yaml
+    content: |
+      runtime-endpoint: unix:///run/containerd/containerd.sock
+      image-endpoint: unix:///run/containerd/containerd.sock
+      timeout: 10
+
+  # Audit policy for CKS practice
+  - path: /etc/kubernetes/audit-policy.yaml
+    content: |
+      apiVersion: audit.k8s.io/v1
+      kind: Policy
+      rules:
+        - level: Metadata
+          resources:
+          - group: ""
+            resources: ["secrets", "configmaps"]
+        - level: RequestResponse
+          resources:
+          - group: ""
+            resources: ["pods"]
+        - level: None
+          users: ["system:kube-proxy"]
+          verbs: ["watch"]
+          resources:
+          - group: ""
+            resources: ["endpoints", "services"]
+        - level: Metadata
+          omitStages:
+          - RequestReceived
+
+runcmd:
+  # Disable swap
+  - swapoff -a
+  - sed -i '/ swap / s/^/#/' /etc/fstab
+
+  # Load kernel modules
+  - modprobe overlay
+  - modprobe br_netfilter
+  - sysctl --system
+
+  # Configure containerd with cgroup v2
+  - mkdir -p /etc/containerd
+  - containerd config default > /etc/containerd/config.toml
+  - sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+  - systemctl restart containerd
+  - systemctl enable containerd
+
+  # Add Kubernetes apt repo
+  - mkdir -p /etc/apt/keyrings
+  - curl -fsSL https://pkgs.k8s.io/core:/stable:/v${K8S_VERSION}/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  - echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${K8S_VERSION}/deb/ /' > /etc/apt/sources.list.d/kubernetes.list
+
+  # Install kubeadm, kubelet, kubectl
+  - apt-get update
+  - apt-get install -y kubelet kubeadm kubectl
+  - apt-mark hold kubelet kubeadm kubectl
+
+  # Enable kubelet
+  - systemctl enable kubelet
+
+  # Create directories for CKS practice
+  - mkdir -p /etc/kubernetes/enc
+  - mkdir -p /var/log/kubernetes/audit
+
+  # Signal that cloud-init is complete
+  - touch /var/lib/cloud/instance/kubeadm-ready
+EOF
+
+    log_success "Cloud-init config generated"
 }
 
 #######################################
@@ -200,18 +348,98 @@ init_control_plane() {
     CONTROL_IP=$(multipass info "$CONTROL_NODE" --format csv | tail -1 | cut -d',' -f3)
     log_progress "Control plane IP: $CONTROL_IP"
 
+    # Determine kubeadm API version
+    local KUBEADM_API_VERSION
+    KUBEADM_API_VERSION=$(get_kubeadm_api_version)
+    log_progress "Using kubeadm API $KUBEADM_API_VERSION"
+
+    # Create kubeadm config with security best practices
+    log_progress "Creating kubeadm configuration..."
+    
+    if [[ "$KUBEADM_API_VERSION" == "v1beta4" ]]; then
+        # v1beta4 format (K8s 1.31+): extraArgs is a list of name/value pairs
+        multipass exec "$CONTROL_NODE" -- bash -c "cat > /tmp/kubeadm-config.yaml <<EOF
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+kubernetesVersion: v${K8S_VERSION}.0
+networking:
+  podSubnet: 192.168.0.0/16
+  serviceSubnet: 10.96.0.0/12
+apiServer:
+  extraArgs:
+    - name: audit-policy-file
+      value: /etc/kubernetes/audit-policy.yaml
+    - name: audit-log-path
+      value: /var/log/kubernetes/audit/audit.log
+    - name: audit-log-maxage
+      value: \"30\"
+    - name: audit-log-maxbackup
+      value: \"10\"
+    - name: audit-log-maxsize
+      value: \"100\"
+    - name: enable-admission-plugins
+      value: NodeRestriction
+  extraVolumes:
+    - name: audit-policy
+      hostPath: /etc/kubernetes/audit-policy.yaml
+      mountPath: /etc/kubernetes/audit-policy.yaml
+      readOnly: true
+    - name: audit-logs
+      hostPath: /var/log/kubernetes/audit
+      mountPath: /var/log/kubernetes/audit
+---
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: ${CONTROL_IP}
+nodeRegistration:
+  criSocket: unix:///var/run/containerd/containerd.sock
+EOF"
+    else
+        # v1beta3 format (K8s 1.22-1.30): extraArgs is a key/value map
+        multipass exec "$CONTROL_NODE" -- bash -c "cat > /tmp/kubeadm-config.yaml <<EOF
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: ClusterConfiguration
+kubernetesVersion: v${K8S_VERSION}.0
+networking:
+  podSubnet: 192.168.0.0/16
+  serviceSubnet: 10.96.0.0/12
+apiServer:
+  extraArgs:
+    audit-policy-file: /etc/kubernetes/audit-policy.yaml
+    audit-log-path: /var/log/kubernetes/audit/audit.log
+    audit-log-maxage: \"30\"
+    audit-log-maxbackup: \"10\"
+    audit-log-maxsize: \"100\"
+    enable-admission-plugins: NodeRestriction
+  extraVolumes:
+    - name: audit-policy
+      hostPath: /etc/kubernetes/audit-policy.yaml
+      mountPath: /etc/kubernetes/audit-policy.yaml
+      readOnly: true
+    - name: audit-logs
+      hostPath: /var/log/kubernetes/audit
+      mountPath: /var/log/kubernetes/audit
+---
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: ${CONTROL_IP}
+nodeRegistration:
+  criSocket: unix:///var/run/containerd/containerd.sock
+EOF"
+    fi
+
     # Initialize kubeadm
     log_progress "Running kubeadm init (this takes 1-2 minutes)..."
     
     if $VERBOSE; then
         multipass exec "$CONTROL_NODE" -- sudo kubeadm init \
-            --apiserver-advertise-address="$CONTROL_IP" \
-            --pod-network-cidr=192.168.0.0/16 \
+            --config=/tmp/kubeadm-config.yaml \
             --skip-phases=addon/kube-proxy 2>&1 | tee /tmp/kubeadm-init.log
     else
         multipass exec "$CONTROL_NODE" -- sudo kubeadm init \
-            --apiserver-advertise-address="$CONTROL_IP" \
-            --pod-network-cidr=192.168.0.0/16 \
+            --config=/tmp/kubeadm-config.yaml \
             --skip-phases=addon/kube-proxy > /tmp/kubeadm-init.log 2>&1
     fi
 
@@ -219,18 +447,18 @@ init_control_plane() {
     log_progress "Configuring kubectl..."
     multipass exec "$CONTROL_NODE" -- bash -c "mkdir -p \$HOME/.kube && sudo cp /etc/kubernetes/admin.conf \$HOME/.kube/config && sudo chown \$(id -u):\$(id -g) \$HOME/.kube/config"
 
-    log_success "Control plane initialized"
+    log_success "Control plane initialized with audit logging enabled"
 }
 
 #######################################
 # Install CNI (Calico)
 #######################################
 install_cni() {
-    log_info "Installing Calico CNI..."
+    log_info "Installing Calico CNI v3.31..."
 
     # Install Calico operator and CRDs
     log_progress "Applying Tigera operator..."
-    multipass exec "$CONTROL_NODE" -- kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/tigera-operator.yaml 2>/dev/null
+    multipass exec "$CONTROL_NODE" -- kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.2/manifests/tigera-operator.yaml 2>/dev/null
 
     # Wait for operator
     log_progress "Waiting for operator to be ready..."
@@ -238,9 +466,9 @@ install_cni() {
 
     # Install Calico custom resources
     log_progress "Applying Calico custom resources..."
-    multipass exec "$CONTROL_NODE" -- kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/custom-resources.yaml 2>/dev/null
+    multipass exec "$CONTROL_NODE" -- kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.2/manifests/custom-resources.yaml 2>/dev/null
 
-    log_success "Calico CNI installed"
+    log_success "Calico CNI v3.31 installed"
 }
 
 #######################################
@@ -373,30 +601,51 @@ copy_kubeconfig() {
 # Print cluster info
 #######################################
 print_summary() {
+    local KUBEADM_API_VERSION
+    KUBEADM_API_VERSION=$(get_kubeadm_api_version)
+    
     echo ""
     echo "========================================"
     echo -e "${GREEN}CKS Practice Cluster Ready!${NC}"
     echo "========================================"
     echo ""
+    echo -e "${CYAN}Cluster Details:${NC}"
+    echo "  Kubernetes:    v$K8S_VERSION"
+    echo "  kubeadm API:   $KUBEADM_API_VERSION"
+    echo "  CNI:           Calico v3.31"
+    echo "  Runtime:       containerd (cgroup v2)"
+    echo "  Ubuntu:        $UBUNTU_VERSION"
+    echo "  Nodes:         3 (1 control + 2 workers)"
+    echo ""
     multipass exec "$CONTROL_NODE" -- kubectl get nodes -o wide
     echo ""
-    echo -e "${BLUE}Quick commands:${NC}"
+    echo -e "${BLUE}Access:${NC}"
     echo "  multipass shell control     # SSH to control plane"
     echo "  multipass shell worker1     # SSH to worker1"
     echo "  multipass shell worker2     # SSH to worker2"
     echo ""
-    echo -e "${BLUE}CKS tools installed on control plane:${NC}"
-    echo "  trivy image nginx:latest    # Scan container images"
-    echo "  sudo kube-bench             # Run CIS benchmark"
-    echo "  sudo systemctl start falco  # Start Falco runtime security"
+    echo -e "${BLUE}From your Mac:${NC}"
+    echo "  export KUBECONFIG=$KUBECONFIG_LOCAL"
     echo ""
-    echo -e "${BLUE}Useful practice areas:${NC}"
-    echo "  - Network Policies (Calico installed)"
-    echo "  - Pod Security Admission"
-    echo "  - RBAC & ServiceAccounts"
-    echo "  - Audit logging"
-    echo "  - Secrets management"
-    echo "  - Container runtime sandboxing"
+    echo -e "${BLUE}CKS Tools (on control plane):${NC}"
+    echo "  trivy image nginx:latest              # Scan images for CVEs"
+    echo "  sudo kube-bench run --targets=master  # CIS benchmark"
+    echo "  sudo systemctl start falco            # Runtime security"
+    echo "  sudo journalctl -fu falco             # View Falco alerts"
+    echo ""
+    echo -e "${BLUE}CKS Practice Features Enabled:${NC}"
+    echo "  ✓ Audit logging (/var/log/kubernetes/audit/audit.log)"
+    echo "  ✓ NetworkPolicy support (Calico)"
+    echo "  ✓ Pod Security Admission ready"
+    echo "  ✓ RBAC enabled"
+    echo "  ✓ NodeRestriction admission plugin"
+    echo ""
+    echo -e "${BLUE}Useful Paths (on control plane):${NC}"
+    echo "  /etc/kubernetes/manifests/         # Static pod manifests"
+    echo "  /etc/kubernetes/audit-policy.yaml  # Audit policy"
+    echo "  /var/log/kubernetes/audit/         # Audit logs"
+    echo "  /etc/kubernetes/pki/               # Certificates"
+    echo "  /etc/kubernetes/enc/               # Encryption configs (practice)"
     echo ""
     echo -e "${YELLOW}To destroy cluster:${NC} ./destroy-cluster.sh"
     echo ""
@@ -408,9 +657,13 @@ print_summary() {
 main() {
     parse_args "$@"
     
+    local KUBEADM_API_VERSION
+    KUBEADM_API_VERSION=$(get_kubeadm_api_version)
+    
     echo ""
     echo "========================================"
     echo "  CKS Practice Cluster Setup"
+    echo "  Kubernetes $K8S_VERSION (kubeadm $KUBEADM_API_VERSION)"
     if $VERBOSE; then
         echo "  (verbose mode)"
     fi
@@ -418,6 +671,8 @@ main() {
     echo ""
 
     check_prerequisites
+    check_cgroup_requirements
+    generate_cloud_init
     launch_vms
     wait_for_cloud_init
     init_control_plane
