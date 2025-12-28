@@ -7,3 +7,12 @@ cloud-init-*.yaml
 *.key
 *.pem
 kubeconfig*
+# Generated files
+kubeconfig
+cks-kubeconfig
+cloud-init-*.yaml
+*.log
+
+# Secrets
+*.key
+*.pem
