@@ -1,0 +1,9 @@
+# Generated files
+cks-kubeconfig
+cloud-init-*.yaml
+*.log
+
+# Secrets
+*.key
+*.pem
+kubeconfig*
